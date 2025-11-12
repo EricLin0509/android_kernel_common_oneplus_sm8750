@@ -104,6 +104,7 @@
 #include <linux/iommu.h>
 #include <linux/tick.h>
 #include <linux/cpufreq_times.h>
+#include <linux/dma-buf.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -1002,6 +1003,7 @@ void __put_task_struct(struct task_struct *tsk)
 	WARN_ON(refcount_read(&tsk->usage));
 	WARN_ON(tsk == current);
 
+	put_dmabuf_info(tsk);
 #ifdef CONFIG_HMBIRD_SCHED
 	hmbird_free(tsk);
 #endif
@@ -2514,10 +2516,16 @@ __latent_entropy struct task_struct *copy_process(
 	p->bpf_ctx = NULL;
 #endif
 
+	retval = copy_dmabuf_info(clone_flags, p);
+	if (retval) {
+		pr_err("failed to copy dmabuf accounting info, err %d\n", retval);
+		goto bad_fork_cleanup_policy;
+	}
+
 	/* Perform scheduler related setup. Assign this task to a CPU. */
 	retval = sched_fork(clone_flags, p);
 	if (retval)
-		goto bad_fork_cleanup_policy;
+		goto bad_fork_cleanup_dmabuf;
 
 	retval = perf_event_init_task(p, clone_flags);
 	if (retval)
