@@ -2525,7 +2525,7 @@ __latent_entropy struct task_struct *copy_process(
 	/* Perform scheduler related setup. Assign this task to a CPU. */
 	retval = sched_fork(clone_flags, p);
 	if (retval)
-		goto bad_fork_cleanup_dmabuf;
+		goto bad_fork_cleanup_policy;
 
 	retval = perf_event_init_task(p, clone_flags);
 	if (retval)
