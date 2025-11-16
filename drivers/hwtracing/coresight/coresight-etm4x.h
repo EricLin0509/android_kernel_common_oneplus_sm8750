@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
  * Copyright (c) 2014-2015, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef _CORESIGHT_CORESIGHT_ETM_H
@@ -1000,6 +1001,7 @@ struct etmv4_drvdata {
 	u8				nr_pe_cmp;
 	u8				nr_addr_cmp;
 	u8				nr_cntr;
+	u8				ext_inp_sel;
 	u8				nr_ext_inp;
 	u8				numcidc;
 	u8				numextinsel;

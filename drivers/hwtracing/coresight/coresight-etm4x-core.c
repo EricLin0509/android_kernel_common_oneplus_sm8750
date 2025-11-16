@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #include <linux/acpi.h>
@@ -31,7 +32,9 @@
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
+#include <linux/of.h>
 #include <linux/clk/clk-conf.h>
+#include <linux/suspend.h>
 
 #include <asm/barrier.h>
 #include <asm/sections.h>
@@ -45,6 +48,7 @@
 #include "coresight-self-hosted-trace.h"
 #include "coresight-syscfg.h"
 #include "coresight-trace-id.h"
+#include "coresight-common.h"
 
 static int boot_enable;
 module_param(boot_enable, int, 0444);
@@ -803,8 +807,13 @@ static int etm4_enable_perf(struct coresight_device *csdev,
 	}
 	drvdata->trcid = (u8)trace_id;
 
+	coresight_csr_set_etr_atid(csdev, drvdata->trcid, true, etm_event_get_path(event));
+
 	/* And enable it */
 	ret = etm4_enable_hw(drvdata);
+
+	if (ret)
+		coresight_csr_set_etr_atid(csdev, drvdata->trcid, false, etm_event_get_path(event));
 
 out:
 	return ret;
@@ -832,6 +841,8 @@ static int etm4_enable_sysfs(struct coresight_device *csdev)
 	if (ret < 0)
 		goto unlock_sysfs_enable;
 
+	coresight_csr_set_etr_atid(csdev, drvdata->trcid, true, NULL);
+
 	/*
 	 * Executing etm4_enable_hw on the cpu whose ETM is being enabled
 	 * ensures that register writes occur when cpu is powered.
@@ -844,8 +855,10 @@ static int etm4_enable_sysfs(struct coresight_device *csdev)
 	if (!ret)
 		drvdata->sticky_enable = true;
 
-	if (ret)
+	if (ret) {
+		coresight_csr_set_etr_atid(csdev, drvdata->trcid, false, NULL);
 		etm4_release_trace_id(drvdata);
+	}
 
 unlock_sysfs_enable:
 	spin_unlock(&drvdata->spinlock);
@@ -998,7 +1011,7 @@ static int etm4_disable_perf(struct coresight_device *csdev,
 	 * perf will release trace ids when _free_aux() is
 	 * called at the end of the session.
 	 */
-
+	coresight_csr_set_etr_atid(csdev, drvdata->trcid, false, etm_event_get_path(event));
 	return 0;
 }
 
@@ -1020,6 +1033,8 @@ static void etm4_disable_sysfs(struct coresight_device *csdev)
 	 * ensures that register writes occur when cpu is powered.
 	 */
 	smp_call_function_single(drvdata->cpu, etm4_disable_hw, drvdata, 1);
+
+	coresight_csr_set_etr_atid(csdev, drvdata->trcid, false, NULL);
 
 	spin_unlock(&drvdata->spinlock);
 	cpus_read_unlock();
@@ -1805,7 +1820,7 @@ static int __etm4_cpu_save(struct etmv4_drvdata *drvdata)
 		state->trcpdcr = etm4x_read32(csa, TRCPDCR);
 
 	/* wait for TRCSTATR.IDLE to go up */
-	if (etm4x_wait_status(csa, TRCSTATR_PMSTABLE_BIT, 1)) {
+	if (etm4x_wait_status(csa, TRCSTATR_IDLE_BIT, 1)) {
 		dev_err(etm_dev,
 			"timeout while waiting for Idle Trace Status\n");
 		etm4_os_unlock(drvdata);
@@ -2059,7 +2074,8 @@ static int etm4_add_coresight_dev(struct etm4_init_arg *init_arg)
 		type_name = "etm";
 	}
 
-	desc.name = devm_kasprintf(dev, GFP_KERNEL,
+	if (of_property_read_string(dev->of_node, "coresight-name", &desc.name))
+		desc.name = devm_kasprintf(dev, GFP_KERNEL,
 				   "%s%d", type_name, drvdata->cpu);
 	if (!desc.name)
 		return -ENOMEM;
@@ -2189,7 +2205,7 @@ static int etm4_probe_amba(struct amba_device *adev, const struct amba_id *id)
 	dev_set_drvdata(dev, drvdata);
 	ret = etm4_probe(dev);
 	if (!ret)
-		pm_runtime_put(&adev->dev);
+		pm_runtime_put_sync(&adev->dev);
 
 	return ret;
 }
@@ -2223,7 +2239,7 @@ static int etm4_probe_platform_dev(struct platform_device *pdev)
 
 	ret = etm4_probe(&pdev->dev);
 
-	pm_runtime_put(&pdev->dev);
+	pm_runtime_put_sync(&pdev->dev);
 	if (ret)
 		pm_runtime_disable(&pdev->dev);
 
@@ -2255,7 +2271,7 @@ static int etm4_probe_cpu(unsigned int cpu)
 
 	etm4_add_coresight_dev(&init_arg);
 
-	pm_runtime_put(init_arg.dev);
+	pm_runtime_put_sync(init_arg.dev);
 	return 0;
 }
 
@@ -2396,8 +2412,43 @@ static int etm4_runtime_resume(struct device *dev)
 }
 #endif
 
+#ifdef CONFIG_DEEPSLEEP
+static int etm_suspend(struct device *dev)
+{
+	struct etmv4_drvdata *drvdata = dev_get_drvdata(dev);
+
+	if (pm_suspend_target_state == PM_SUSPEND_MEM)
+		coresight_disable(drvdata->csdev);
+
+	return 0;
+}
+#else
+static int etm_suspend(struct device *dev)
+{
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_HIBERNATION
+static int etm_freeze(struct device *dev)
+{
+	struct etmv4_drvdata *drvdata = dev_get_drvdata(dev);
+
+	coresight_disable(drvdata->csdev);
+
+	return 0;
+}
+#else
+static int etm_freeze(struct device *dev)
+{
+	return 0;
+}
+#endif
+
 static const struct dev_pm_ops etm4_dev_pm_ops = {
 	SET_RUNTIME_PM_OPS(etm4_runtime_suspend, etm4_runtime_resume, NULL)
+	.suspend = etm_suspend,
+	.freeze  = etm_freeze,
 };
 
 static const struct of_device_id etm4_sysreg_match[] = {
