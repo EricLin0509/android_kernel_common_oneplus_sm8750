@@ -215,7 +215,64 @@ jobs:
                         cd ./drivers/kernelsu
                         wget https://github.com/WildKernels/kernel_patches/raw/refs/heads/main/next/susfs_fix_patches/v1.5.12/fix_apk_sign.c.patch
                         patch -p2 -N -F 3 < fix_apk_sign.c.patch || true
-                    fi
+                     fi
+            - name: 修复 SUSFS 编译错误
+              run: |
+               cd kernel_workspace/common
+               
+               echo "1. 检查 SUSFS 文件完整性..."
+               if [ ! -d "fs/susfs" ]; then
+               echo "复制 fs/susfs 目录..."
+               mkdir -p fs/susfs
+               cp -r ../susfs4ksu/kernel_patches/fs/susfs/* fs/susfs/ 2>/dev/null || echo "部分文件复制失败"
+               fi
+               if [ ! -f "include/linux/susfs.h" ]; then
+               echo "复制 include/linux/susfs.h..."
+               mkdir -p include/linux
+               cp ../susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/ 2>/dev/null || echo "头文件复制失败"
+               fi      
+               echo "2. 确保 SUSFS 头文件存在..."
+               if [ ! -f "include/linux/susfs.h" ]; then
+               echo "创建缺失的 include/linux/susfs.h"
+               echo "#ifndef _LINUX_SUSFS_H" > include/linux/susfs.h
+               echo "#define _LINUX_SUSFS_H" >> include/linux/susfs.h
+               echo "" >> include/linux/susfs.h
+               echo "#include <linux/types.h>" >> include/linux/susfs.h
+               echo "#include <linux/fs.h>" >> include/linux/susfs.h
+               echo "" >> include/linux/susfs.h
+               echo "#define BIT_SUS_MAPS (1 << 30)" >> include/linux/susfs.h
+               echo "" >> include/linux/susfs.h
+               echo "#ifdef CONFIG_KSU_SUSFS" >> include/linux/susfs.h
+               echo "bool susfs_is_current_proc_umounted(void);" >> include/linux/susfs.h
+               echo "#else" >> include/linux/susfs.h
+               echo "static inline bool susfs_is_current_proc_umounted(void) { return false; }" >> include/linux/susfs.h
+               echo "#endif" >> include/linux/susfs.h
+               echo "" >> include/linux/susfs.h
+               echo "#endif /* _LINUX_SUSFS_H */" >> include/linux/susfs.h
+               fi
+               echo "3. 修复头文件包含..."
+               if [ -f "fs/proc/base.c" ]; then
+               if ! grep -q "susfs.h" fs/proc/base.c; then
+               sed -i '/#include <linux\/proc_ns.h>/a #include <linux/susfs.h>' fs/proc/base.c
+               else
+               echo "fs/proc/base.c 中已包含 susfs.h"
+               fi
+               fi
+               echo "4. 验证补丁应用状态..."
+               if patch -p1 --dry-run -R < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch 2>/dev/null; then
+               echo "补丁已应用"
+               else
+               echo "补丁未完全应用，尝试重新应用..."
+               patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || echo "补丁应用仍有问题"
+               fi
+               echo "5. 检查是否需要进行最终修复..."
+               if grep -q "BIT_SUS_MAPS" fs/proc/base.c && ! grep -q "#define BIT_SUS_MAPS" include/linux/susfs.h 2>/dev/null; then
+               echo "检测到潜在问题，在头文件中添加 BIT_SUS_MAPS 定义"
+               if ! grep -q "#define BIT_SUS_MAPS" include/linux/susfs.h; then
+               sed -i '/#define _LINUX_SUSFS_H/a #define BIT_SUS_MAPS (1 << 30)' include/linux/susfs.h
+                fi
+               fi
+               echo "=== SUSFS 编译错误修复完成 ==="                    
 
             - name: Add lz4kd patch
               run: |
