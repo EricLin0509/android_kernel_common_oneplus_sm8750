@@ -1,0 +1,417 @@
+name: Build Release Kernel
+
+env:
+    TZ: Asia/Shanghai
+    ANDROID_VERSION: 'android15'
+    KERNEL_VERSION: '6.6'
+    KERNEL_NAME: 'android15-8-gb10d63bc1566-abogki14419598-4k'
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_type:
+        description: 'SU分支'
+        required: true
+        type: choice
+        default: 'sukisu'
+        options:
+          - 'sukisu'
+          - 'ksunext'
+      kernel_suffix:
+        description: '内核后缀'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        outputs:
+            ksuver: ${{ steps.ksu_version.outputs.ksuver }}
+        steps:
+            - name: Download Kernel source and build tools
+              run: |
+                    rm -rf kernel_workspace
+                    mkdir kernel_workspace
+                    cd kernel_workspace
+          
+                    sudo apt-mark hold firefox
+                    sudo apt-mark hold libc-bin
+                    sudo apt purge man-db
+                    sudo rm -rf /var/lib/man-db/auto-update
+                    sudo apt-get update
+                    sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev ccache
+
+                    echo "Downloading kernel source..."
+                    git clone https://github.com/skk0042/sm8750-kernel-build.git -b main common
+                    # Initialize submodules
+                    cd common
+                    echo "Initializing submodules..."
+                    git submodule init
+                    git submodule update --depth=1 --recommend-shallow
+                    cd ..
+
+                    echo "Downloading build tools..."
+                    mkdir -p clang18
+                    aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip
+                    unzip -q clang.zip -d clang18
+                    rm -rf clang.zip
+
+                    aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip -o build-tools.zip
+                    unzip -q build-tools.zip
+                    rm -rf build-tools.zip
+                    
+                    echo "Source code and build tools downloaded."
+                    echo "Removing ABI protected exports and -dirty suffix"
+                    rm common/android/abi_gki_protected_exports_* || true
+                    for f in common/scripts/setlocalversion; do
+                        sed -i 's/ -dirty//g' "$f"
+                        sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+                    done
+                    
+            - name: Configure ccache directory
+              run: |
+                    echo "CCACHE_DIR=$HOME/.ccache_release" >> $GITHUB_ENV
+                    echo "CCACHE_MAXSIZE=3G" >> $GITHUB_ENV
+                    echo "Current disk space:"
+                    df -h
+                    echo "Current kernel version: 6.6.X Release"
+
+            - name: Restore ccache cache
+              uses: actions/cache@v4
+              id: ccache-restore
+              with:
+                path: ${{ env.CCACHE_DIR }}
+                key: ccache-release-6.6.X-${{ runner.os }}-main
+                restore-keys: |
+                    ccache-release-6.6.X-${{ runner.os }}-
+                    ccache-release-6.6.X-
+
+            - name: Initialize and configure ccache
+              run: |
+                    # Set ccache environment variables
+                    export CCACHE_COMPILERCHECK="none"
+                    export CCACHE_BASEDIR="${{ github.workspace }}"
+                    export CCACHE_NOHASHDIR="true"
+                    export CCACHE_HARDLINK="true"
+                    export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+                    export CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
+                    
+                    # Ensure ccache directory exists
+                    mkdir -p "$CCACHE_DIR"
+                    
+                    # Configure cache size every run
+                    echo "Configuring ccache cache size: $CCACHE_MAXSIZE"
+                    ccache -M "$CCACHE_MAXSIZE"
+                    ccache -o compression=true
+                    
+                    # Add more ccache optimization options
+                    echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,pch_defines,file_macro,time_macros" >> "$CCACHE_DIR/ccache.conf"
+                    echo "hash_dir = false" >> "$CCACHE_DIR/ccache.conf"
+                    
+                    # Show initial cache status
+                    echo "ccache initial status:"
+                    ccache -s
+                    
+                    # If cache hit, show details
+                    if [ "${{ steps.ccache-restore.outputs.cache-hit }}" == 'true' ]; then
+                        echo "ccache cache hit details:"
+                        ccache -sv
+                    fi                    
+            - name: Add KernelSU
+              id: ksu_version
+              run: |
+                    # Enter kernel workspace
+                    cd kernel_workspace
+                    if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+                        echo "Configuring SukiSU Ultra..."
+                        curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/refs/heads/main/kernel/setup.sh" | bash -s susfs-main
+                        cd ./KernelSU
+                        # Get current Git commit short hash (8 digits)
+                        GIT_COMMIT_HASH=$(git rev-parse --short=8 HEAD)
+                        echo "Current commit hash: $GIT_COMMIT_HASH"
+                        export KSU_VERSION=$KSU_VERSION
+                        # Try up to 3 times to get KernelSU API version
+                        for i in {1..3}; do
+                            # Extract KSU_API_VERSION from remote Makefile
+                            KSU_API_VERSION=$(curl -s "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/susfs-main/kernel/Makefile" | 
+                                grep -m1 "KSU_VERSION_API :=" | 
+                                awk -F'= ' '{print $2}' | 
+                                tr -d '[:space:]')
+                            # Break loop if successful, otherwise wait 1 second and retry
+                            [ -n "$KSU_API_VERSION" ] && break || sleep 1
+                        done
+                        # Use default version 3.1.7 if failed
+                        [ -z "$KSU_API_VERSION" ] && KSU_API_VERSION="3.1.7"
+                        # Store API version to GitHub environment variable
+                        echo "KSU_API_VERSION=$KSU_API_VERSION" >> $GITHUB_ENV
+            
+                        # Generate custom version number (based on commit count), use 114514 on failure
+                        KSU_VERSION=$(expr $(git rev-list --count main) + 37185 2>/dev/null || echo 114514)
+                        # Store version number to GitHub environment variable
+                        echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+                        echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+                        
+                        # Create version definition template & version format function
+                        VERSION_DEFINITIONS=$'define get_ksu_version_full\nv\\$1-'"$KSU_VERSION"$'-'"$GIT_COMMIT_HASH"$'@安和昴\nendef\n\nKSU_VERSION_API := '"$KSU_API_VERSION"$'\nKSU_VERSION_FULL := v'"$KSU_API_VERSION"$'-'"$KSU_VERSION"$'-'"$GIT_COMMIT_HASH"$'@安和昴'
+                        # Clean old version definitions in kernel Makefile
+                        sed -i '/define get_ksu_version_full/,/endef/d' kernel/Makefile
+                        sed -i '/KSU_VERSION_API :=/d' kernel/Makefile
+                        sed -i '/KSU_VERSION_FULL :=/d' kernel/Makefile
+                        # Insert new version definitions after REPO_OWNER line
+                        awk -v def="$VERSION_DEFINITIONS" '
+                            /REPO_OWNER :=/ {print; print def; inserted=1; next}
+                            1
+                            END {if (!inserted) print def}
+                        ' kernel/Makefile > kernel/Makefile.tmp && mv kernel/Makefile.tmp kernel/Makefile
+
+                        # Verify changes
+                        grep -A10 "REPO_OWNER" kernel/Makefile
+                        grep "KSU_VERSION_FULL" kernel/Makefile
+                        echo "SukiSU version: v${KSU_API_VERSION}-${KSU_VERSION}-${GIT_COMMIT_HASH}@安和昴"
+                    else
+                        echo "Configuring KernelSU Next..."
+                        curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+                        cd KernelSU-Next
+                        KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/pershoot/KernelSU-Next/commits?sha=next&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 10200)
+                        echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+                        echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+                        sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+                    fi
+
+            - name: Apply SukiSU Ultra patches
+              run: |
+                    cd kernel_workspace
+                    if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+                        echo "Adding SukiSU Ultra patches..."
+                        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+                        git clone https://github.com/ShirkNeko/SukiSU_patch.git
+                        
+                        # Copy SUSFS patch files
+                        cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+                        cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+                        cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+                        
+                        # Apply patches
+                        cd common
+                        echo "Applying SUSFS patches..."
+                        patch -p1 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+                        
+                        # Apply hide patch
+                        cp ../SukiSU_patch/69_hide_stuff.patch ./
+                        echo "Applying hide patches..."
+                        patch -p1 -F 3 < 69_hide_stuff.patch || true
+                        
+                        echo "SukiSU Ultra patches applied"
+                    else
+                        echo "Adding KernelSU Next patches..."
+                        git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+                        git clone https://github.com/WildKernels/kernel_patches.git
+                        cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+                        cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+                        cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+                        patch -p1 -N -F 3 < 69_hide_stuff.patch || true
+                        # Add WildKSU manager support for KernelSU Next
+                        cd ./drivers/kernelsu
+                        wget https://github.com/WildKernels/kernel_patches/raw/refs/heads/main/next/susfs_fix_patches/v1.5.12/fix_apk_sign.c.patch
+                        patch -p2 -N -F 3 < fix_apk_sign.c.patch || true
+                    fi
+
+            - name: Add lz4kd patch
+              run: |
+                    echo "Adding lz4kd patch..."
+                    cd kernel_workspace
+                    if [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
+                        git clone https://github.com/ShirkNeko/SukiSU_patch.git
+                    fi
+                    cd common
+                    cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/
+                    cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib
+                    cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto
+                    cp ../SukiSU_patch/other/zram/zram_patch/${{ env.KERNEL_VERSION }}/lz4kd.patch ./
+                    patch -p1 -F 3 < lz4kd.patch || true
+
+            - name: Replace Kernel version suffix and add configurations
+              run: |
+                    cd kernel_workspace
+                    echo "Replacing kernel version suffix..."
+                    if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
+                        echo "Current kernel version suffix: ${{ github.event.inputs.kernel_suffix }}"
+                        for f in ./common/scripts/setlocalversion; do
+                            sed -i "\$s|echo \"\\\$res\"|echo \"-${{ github.event.inputs.kernel_suffix }}\"|" "$f"
+                        done
+                        sed -i 's/-4k/-'"${{ github.event.inputs.kernel_suffix }}"'/g' ./common/arch/arm64/configs/gki_defconfig
+                    else
+                        echo "Current kernel version: ${{ env.KERNEL_NAME }}"
+                        for f in ./common/scripts/setlocalversion; do
+                            sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" "$f"
+                        done
+                        sed -i 's/-4k/-'"${{ env.KERNEL_NAME }}"'/g' ./common/arch/arm64/configs/gki_defconfig
+                    fi
+                    sed -i 's/${scm_version}//' ./common/scripts/setlocalversion
+                    echo "CONFIG_LOCALVERSION_AUTO=n" >> ./common/arch/arm64/configs/gki_defconfig
+
+                    echo "Enable -O3 optimization"
+                    echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "Disable defconfig check"
+                    sed -i 's/check_defconfig//' ./common/build.config.gki
+                    echo "Disable headers installation"
+                    echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
+
+                    echo "Enable ADIOS-IO scheduler"
+                    echo "CONFIG_MQ_IOSCHED_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y" >> ./common/arch/arm64/configs/gki_defconfig
+
+
+                    # Add SUSFS configurations
+                    echo "Adding SUSFS configurations..."
+                    echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_SUS_MAP=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    
+                    # TMPFS configurations
+                    echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    
+                    # ZRAM configurations
+                    echo "CONFIG_ZSMALLOC=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_CRYPTO_LZ4HC=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_CRYPTO_LZ4K=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    
+                    # KPM support
+                    echo "CONFIG_KPM=y" >> ./common/arch/arm64/configs/gki_defconfig
+                    
+                    
+            - name: Build Kernel
+              run: |
+                    WORKDIR="$(pwd)"
+                    export PATH="/usr/lib/ccache:$PATH"
+                    export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+                    export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+                    
+                    # Set ccache environment variables
+                    export CCACHE_COMPILERCHECK="none"
+                    export CCACHE_BASEDIR="${{ github.workspace }}"
+                    export CCACHE_NOHASHDIR="true"
+                    export CCACHE_HARDLINK="true"
+                    export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+                    export CCACHE_MAXSIZE="3G"
+                    
+                    CLANG_DIR="$WORKDIR/kernel_workspace/clang18/bin"
+                    CLANG_VERSION="$($CLANG_DIR/clang --version | head -n 1)"
+                    LLD_VERSION="$($CLANG_DIR/ld.lld --version | head -n 1)"
+                    echo "Compiler infos:"
+                    echo "Clang version: $CLANG_VERSION"
+                    echo "LLD version: $LLD_VERSION"
+                    pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole version: not installed" || echo "pahole version: $pahole_version"
+
+                    cd kernel_workspace/common
+                    echo "Building kernel..."
+                    make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O3 KCFLAGS+=-Wno-error gki_defconfig &&
+                    make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O3 KCFLAGS+=-Wno-error Image
+                    
+                    echo "Kernel build completed!"
+                    echo "ccache status:"
+                    ccache -s
+                    echo "Disk space after build:"
+                    df -h
+
+            - name: Pack Kernel image with AnyKernel3
+              run: |
+                    cd kernel_workspace
+                    # Use your AnyKernel3 repository
+                    git clone https://github.com/skk0042/AnyKernel3.git --depth=1
+                    rm -rf ./AnyKernel3/.git
+                    
+                    # Find Image file
+                    image_path=$(find "./common/out/arch/arm64/boot" -name "Image" | head -n 1)
+                    if [ -z "$image_path" ]; then
+                        image_path=$(find "./common/out" -name "Image" | head -n 1)
+                    fi
+                    if [ -z "$image_path" ]; then
+                        image_path=$(find "./" -name "Image" | head -n 1)
+                    fi
+                    
+                    if [ -n "$image_path" ] && [ -f "$image_path" ]; then
+                        echo "Image file found at: $image_path"
+                        cp "$image_path" ./AnyKernel3/Image
+                        echo "Kernel image added."
+                    else
+                        echo "Kernel image not found!"
+                        exit 1
+                    fi
+                    
+                    cd AnyKernel3
+                    echo "Zipping AnyKernel3..."
+                    zip -r ../AnyKernel3_${{ env.KERNEL_VERSION }}_A15_${{ env.KERNEL_NAME }}_${{ github.event.inputs.ksu_type == 'sukisu' && 'SukiSU' || 'KSUNext' }}_${{ env.KSUVER }}.zip ./*
+                    if [ ! -f ../*.zip ]; then
+                        echo "[ERROR] Zipped failed!"
+                        exit 1
+                    fi
+                    echo "AnyKernel3 zipped."
+                    
+                    
+             - name: Upload Kernel Zip Artifacts
+              uses: actions/upload-artifact@v4
+              with:
+                  name: Kernel_ZIP_${{ github.event.inputs.ksu_type == 'sukisu' && 'SukiSU' || 'KSUNext' }}_${{ env.KSUVER }}
+                  path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
+
+    release:
+        needs: build
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+            packages: write
+            actions: read
+
+        steps:
+            - name: Download Kernel Zip Artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  name: Kernel_ZIP_${{ github.event.inputs.ksu_type == 'sukisu' && 'SukiSU' || 'KSUNext' }}_${{ needs.build.outputs.ksuver }}
+                  path: ./release_zips
+
+            - name: Set Variables
+              run: |
+                    FULL_VERSION=${{ format('{0}.114-{1}', env.KERNEL_VERSION, env.KERNEL_NAME) }}
+                    echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+                    TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+                    TIME_FORM="$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')"
+                    echo "TIME=$TIME" >> $GITHUB_ENV
+                    echo "TIME_FORM=$TIME_FORM" >> $GITHUB_ENV
+                    echo "KSU_TYPE=${{ github.event.inputs.ksu_type }}" >> $GITHUB_ENV
+                    echo "KSUVER=${{ needs.build.outputs.ksuver }}" >> $GITHUB_ENV
+
+            - name: Create Release
+              id: create_release
+              uses: softprops/action-gh-release@v1
+              with:
+                tag_name: "${{ env.KERNEL_NAME }}-${{ env.KSU_TYPE }}-${{ env.TIME }}"
+                name: "OPlus-${{env.FULL_VERSION}} (${{ env.KSU_TYPE }}) ${{ env.TIME_FORM }}"
+                body: |
+                    ### "Release ${{ env.FULL_VERSION }} built on ${{ env.TIME_FORM }}"
+                    - Kernel version: ${{ env.FULL_VERSION }}
+                    - Build time: ${{ env.TIME_FORM }}
+                    - KernelSU Type: ${{ env.KSU_TYPE }}
+                    - KSU Version: ${{ env.KSUVER }}
+
+                draft: false
+                prerelease: false
+                files: |
+                    release_zips/AnyKernel*.zip                   
+                    
