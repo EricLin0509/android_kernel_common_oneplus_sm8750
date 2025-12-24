@@ -29,5 +29,3 @@ obj-$(CONFIG_SECURITY_LANDLOCK)		+= landlock/
 obj-$(CONFIG_INTEGRITY)			+= integrity/
 
 obj-$(CONFIG_BBG) += baseband-guard/
-
-obj-$(CONFIG_BBG) += baseband-guard/
