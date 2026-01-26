@@ -17,6 +17,14 @@
 #include <linux/of.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/reset.h>
+#include <linux/clk/qcom.h>
+#include <linux/nvmem-consumer.h>
+#include <linux/ipc_logging.h>
+#include <linux/pinctrl/qcom-pinctrl.h>
+#if IS_ENABLED(CONFIG_QTI_CRYPTO_FDE)
+#include <linux/crypto-qti-common.h>
+#include <linux/of_platform.h>
+#endif
 
 #include <soc/qcom/ice.h>
 
@@ -2701,13 +2709,187 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 					dev_name(&pdev->dev), host);
 	if (ret) {
 		dev_err(&pdev->dev, "Request IRQ failed (%d)\n", ret);
-		goto clk_disable;
+		return ret;
 	}
 
-	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY | MMC_CAP_NEED_RSP_BUSY;
+	return 0;
+}
 
-	/* Set the timeout value to max possible */
-	host->max_timeout_count = 0xF;
+#if IS_ENABLED(CONFIG_QTI_CRYPTO_FDE)
+static int sdhci_crypto_probe_check(struct device *dev)
+{
+	struct platform_device *dep_pdev;
+	struct device_node *dep_dev;
+
+	dep_dev = of_parse_phandle(dev->of_node, "sdhc-msm-crypto", 0);
+	if (dep_dev) {
+		dep_pdev = of_find_device_by_node(dep_dev);
+		if (!dep_pdev || !dep_pdev->dev.driver) {
+			of_node_put(dep_dev);
+			dev_warn(dev, "Failed to create sdcc-ice data structures\n");
+			if (dep_pdev)
+				platform_device_put(dep_pdev);
+			return -EPROBE_DEFER;
+		}
+		platform_device_put(dep_pdev);
+		of_node_put(dep_dev);
+		dev_dbg(dev, "sdcc-ice probe successfully\n");
+	}
+	return 0;
+}
+#endif
+
+static int sdhci_msm_probe(struct platform_device *pdev)
+{
+	struct sdhci_host *host;
+	struct sdhci_pltfm_host *pltfm_host;
+	struct sdhci_msm_host *msm_host;
+	int ret;
+	u32 config;
+	const struct sdhci_msm_offset *msm_offset;
+	const struct sdhci_msm_variant_info *var_info;
+	struct device *dev = &pdev->dev;
+	struct device_node *node = dev->of_node;
+
+	if (of_property_read_bool(node, "non-removable") && !sdhci_qcom_read_boot_config(pdev)) {
+		dev_err(dev, "SDHCI is not boot dev.\n");
+		return 0;
+	}
+
+#if IS_ENABLED(CONFIG_QTI_CRYPTO_FDE)
+	if (sdhci_crypto_probe_check(dev))
+		return -EPROBE_DEFER;
+#endif
+
+	host = sdhci_pltfm_init(pdev, &sdhci_msm_pdata, sizeof(*msm_host));
+	if (IS_ERR(host))
+		return PTR_ERR(host);
+
+	host->sdma_boundary = 0;
+	pltfm_host = sdhci_priv(host);
+	msm_host = sdhci_pltfm_priv(pltfm_host);
+	msm_host->mmc = host->mmc;
+	msm_host->pdev = pdev;
+
+	sdhci_msm_init_sysfs(dev);
+#if defined(CONFIG_SDHCI_MSM_DBG)
+	msm_host->dbg_en = true;
+#endif
+
+	msm_host->sdhci_msm_ipc_log_ctx = ipc_log_context_create(SDHCI_MSM_MAX_LOG_SZ,
+							dev_name(&host->mmc->class_dev), 0);
+	if (!msm_host->sdhci_msm_ipc_log_ctx)
+		dev_warn(dev, "IPC Log init - failed\n");
+	/**
+	 * System resume triggers a card detect interrupt even when there's no
+	 * card inserted. Core layer acquires the registered wakeup source for
+	 * 5s thus preventing system suspend for 5s at least.
+	 * Disable this wakesource until this is sorted out.
+	 */
+	if ((host->mmc->ws) && !(host->mmc->caps & MMC_CAP_NONREMOVABLE)) {
+		wakeup_source_unregister(host->mmc->ws);
+		host->mmc->ws = NULL;
+	}
+
+	ret = mmc_of_parse(host->mmc);
+	if (ret)
+		goto pltfm_free;
+
+	if (pdev->dev.of_node) {
+		ret = of_alias_get_id(pdev->dev.of_node, "mmc");
+		if (ret < 0)
+			dev_err(&pdev->dev, "get slot index failed %d\n", ret);
+		else if (ret <= 2)
+			sdhci_slot[ret] = msm_host;
+	}
+
+	/*
+	 * Based on the compatible string, load the required msm host info from
+	 * the data associated with the version info.
+	 */
+	var_info = of_device_get_match_data(&pdev->dev);
+
+	if (!var_info) {
+		dev_err(&pdev->dev, "Compatible string not found\n");
+		goto pltfm_free;
+	}
+
+	msm_host->mci_removed = var_info->mci_removed;
+	msm_host->restore_dll_config = var_info->restore_dll_config;
+	msm_host->var_ops = var_info->var_ops;
+	msm_host->offset = var_info->offset;
+
+	msm_offset = msm_host->offset;
+
+	sdhci_get_of_property(pdev);
+	sdhci_msm_get_of_property(pdev, host);
+
+	msm_host->saved_tuning_phase = INVALID_TUNING_PHASE;
+
+	ret = sdhci_msm_populate_pdata(dev, msm_host);
+	if (ret) {
+		dev_err(&pdev->dev, "DT parsing error\n");
+		goto pltfm_free;
+	}
+
+	sdhci_msm_gcc_reset(&pdev->dev, host);
+	msm_host->regs_restore.is_supported =
+		of_property_read_bool(dev->of_node,
+			"qcom,restore-after-cx-collapse");
+
+	ret = sdhci_msm_setup_clocks_and_bus(msm_host);
+	if (ret)
+		goto pltfm_free;
+
+	/* Setup regulators */
+	ret = sdhci_msm_vreg_init(&pdev->dev, msm_host, true);
+	if (ret) {
+		dev_err(&pdev->dev, "Regulator setup failed (%d)\n", ret);
+		goto bus_clk_deinit;
+	}
+
+	if (!msm_host->mci_removed) {
+		msm_host->core_mem = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(msm_host->core_mem)) {
+			ret = PTR_ERR(msm_host->core_mem);
+			goto vreg_deinit;
+		}
+	}
+
+	/* Reset the vendor spec register to power on reset state */
+	writel_relaxed(CORE_VENDOR_SPEC_POR_VAL,
+			host->ioaddr + msm_offset->core_vendor_spec);
+
+	/* Ensure SDHCI FIFO is enabled by disabling alternative FIFO */
+	config = readl_relaxed(host->ioaddr + msm_offset->core_vendor_spec3);
+	config &= ~CORE_FIFO_ALT_EN;
+	writel_relaxed(config, host->ioaddr + msm_offset->core_vendor_spec3);
+
+	if (!msm_host->mci_removed) {
+		/* Set HC_MODE_EN bit in HC_MODE register */
+		msm_host_writel(msm_host, HC_MODE_EN, host,
+				msm_offset->core_hc_mode);
+		config = msm_host_readl(msm_host, host,
+				msm_offset->core_hc_mode);
+		config |= FF_CLK_SW_RST_DIS;
+		msm_host_writel(msm_host, config, host,
+				msm_offset->core_hc_mode);
+	}
+
+	if (of_property_read_bool(node, "is_rumi"))
+		sdhci_msm_set_rumi_bus_mode(host);
+
+	sdhci_set_default_hw_caps(msm_host, host);
+
+	ret = sdhci_msm_register_vreg(msm_host);
+	if (ret)
+		goto vreg_deinit;
+
+	ret = sdhci_msm_setup_pwr_irq(msm_host);
+	if (ret)
+		goto vreg_deinit;
+
+	sdhci_msm_set_caps(msm_host);
 
 	/* Enable force hw reset during cqe recovery */
 	msm_host->mmc->cqe_recovery_reset_always = true;
