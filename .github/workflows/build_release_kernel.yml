@@ -5,6 +5,7 @@ env:
     ANDROID_VERSION: 'android15'
     KERNEL_VERSION: '6.6'
     KERNEL_NAME: 'android15-8-gb10d63bc1566-abogki14419598-4k'
+    BRANCH_NAME: ${{ github.ref_name }}
 
 on:
     workflow_dispatch:
@@ -27,7 +28,8 @@ jobs:
                     sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev ccache
 
                     echo "Downloading kernel source..."
-                    git clone https://github.com/EricLin0509/android_kernel_oneplus_sm8750/ -b Test --depth=1 common
+                    echo "Chosen branch: ${{ env.BRANCH_NAME }}"
+                    git clone https://github.com/EricLin0509/android_kernel_oneplus_sm8750/ -b ${{ env.BRANCH_NAME }} --depth=1 common
                     # Initialize submodules
                     cd common
                     echo "Initializing submodules..."
