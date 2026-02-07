@@ -29,7 +29,7 @@ jobs:
 
                     echo "Downloading kernel source..."
                     echo "Chosen branch: ${{ env.BRANCH_NAME }}"
-                    git clone https://github.com/EricLin0509/android_kernel_oneplus_sm8750/ -b ${{ env.BRANCH_NAME }} --depth=1 common
+                    git clone https://github.com/EricLin0509/android_kernel_common_oneplus_sm8750/ -b ${{ env.BRANCH_NAME }} --depth=1 common
                     # Initialize submodules
                     cd common
                     echo "Initializing submodules..."
