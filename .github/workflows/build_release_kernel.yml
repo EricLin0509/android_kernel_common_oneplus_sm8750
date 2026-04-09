@@ -81,6 +81,9 @@ jobs:
                     echo "LLD version: $LLD_VERSION"
                     pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole version: not installed" || echo "pahole version: $pahole_version"
 
+                    echo "Setting the fake timestamp"
+                    export KBUILD_BUILD_TIMESTAMP="Mon Dec 1 09:40:16 UTC 2025"
+
                     cd kernel_workspace/common
                     echo "Building kernel..."
                     make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig &&
