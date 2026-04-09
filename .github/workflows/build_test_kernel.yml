@@ -4,7 +4,7 @@ env:
     TZ: Asia/Shanghai
     ANDROID_VERSION: 'android15'
     KERNEL_VERSION: '6.6'
-    KERNEL_NAME: 'android15-8-gb10d63bc1566-abogki14419598-4k'
+    KERNEL_NAME: 'android15-8-g62da97766d8a-ab15169100-4k'
     BRANCH_NAME: ${{ github.ref_name }}
 
 on:
@@ -74,6 +74,9 @@ jobs:
                     echo "Clang version: $CLANG_VERSION"
                     echo "LLD version: $LLD_VERSION"
                     pahole_version=$(pahole --version 2>/dev/null | head -n1); [ -z "$pahole_version" ] && echo "pahole version: not installed" || echo "pahole version: $pahole_version"
+
+                    echo "Setting the fake timestamp"
+                    export KBUILD_BUILD_TIMESTAMP="Mon Dec 1 09:40:16 UTC 2025"
 
                     cd kernel_workspace/common
                     echo "Building kernel..."
